@@ -17,7 +17,10 @@
 #include <stdio.h>
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_check.h"
 #include "esp32_usb_cdc_acm_port.h"
+#include "cp210x.hpp"
 
 #define ESP_SERIAL_JTAG_PID 0x1001
 
@@ -26,6 +29,7 @@ static const char *TAG = "usb_cdc_acm_port";
 static cdc_acm_dev_hdl_t s_acm_device;
 static StreamBufferHandle_t s_rx_stream_buffer;
 static bool s_is_usb_serial_jtag;
+static bool s_is_cp210x;
 static loader_port_esp32_usb_cdc_acm_callback_t s_acm_host_error_callback;
 static loader_port_esp32_usb_cdc_acm_callback_t s_device_disconnected_callback;
 static loader_port_esp32_usb_cdc_acm_callback_t s_acm_host_serial_state_callback;
@@ -111,9 +115,7 @@ static void usb_serial_converter_reset_target(void)
 static void usb_serial_converter_enter_bootloader(void)
 {
     cdc_acm_host_set_control_line_state(s_acm_device, true, false);
-
     usb_serial_converter_reset_target();
-
     loader_port_delay_ms(SERIAL_FLASHER_BOOT_HOLD_TIME_MS);
     cdc_acm_host_set_control_line_state(s_acm_device, false, false);
 }
@@ -172,6 +174,7 @@ esp_loader_error_t loader_port_esp32_usb_cdc_acm_init(const loader_esp32_usb_cdc
      * device is connected via internal USB Serial/JTAG or an USB to serial converter which
      * connects to target UART and BOOT/RST pins. See pages 1207 and 1208 of the ESP32-S3 TRM */
     s_is_usb_serial_jtag = config->device_pid == ESP_SERIAL_JTAG_PID;
+    s_is_cp210x = config->device_vid == CP210X_VID;
 
     s_rx_stream_buffer = xStreamBufferCreate(1024, 1);
 
@@ -194,11 +197,19 @@ esp_loader_error_t loader_port_esp32_usb_cdc_acm_init(const loader_esp32_usb_cdc
                                       &dev_config,
                                       &s_acm_device);
 
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open the USB device");
         esp_loader_error_t deinit_status = loader_port_esp32_usb_cdc_acm_deinit();
         assert(deinit_status == ESP_LOADER_SUCCESS);
         return ESP_LOADER_ERROR_FAIL;
+    }
+
+    if (s_is_cp210x) {
+        esp_err_t cp_status = cp210_init(s_acm_device);
+        if (cp_status != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable CP210x interface");
+        }
     }
 
     return ESP_LOADER_SUCCESS;
@@ -228,13 +239,14 @@ esp_loader_error_t loader_port_esp32_usb_cdc_acm_deinit(void)
     return ESP_LOADER_SUCCESS;
 }
 
-
 void loader_port_enter_bootloader(void)
 {
     assert(s_acm_device != NULL && s_rx_stream_buffer != NULL);
 
     if (s_is_usb_serial_jtag) {
         usb_serial_jtag_enter_booloader();
+    } else if (s_is_cp210x) {
+        cp210_enter_bootloader(s_acm_device);
     } else {
         usb_serial_converter_enter_bootloader();
     }
@@ -247,6 +259,8 @@ void loader_port_reset_target(void)
 
     if (s_is_usb_serial_jtag) {
         usb_serial_jtag_reset_target();
+    } else if (s_is_cp210x){
+        cp210_reset(s_acm_device);
     } else {
         usb_serial_converter_reset_target();
     }
